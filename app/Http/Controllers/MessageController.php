@@ -36,12 +36,23 @@ class MessageController extends Controller
      */
     public function streamMessage(Conversation $conversation, Request $request)
     {
-        // Augmenter le timeout PHP
-        set_time_limit(120); // 2 minutes
+        // Augmenter le timeout PHP et la limite de mémoire
+        set_time_limit(180); // 3 minutes
+        ini_set('memory_limit', '512M');
 
         $request->validate([
-            'message' => 'required|string',
-            'model'   => 'nullable|string',
+            'message' => [
+                'required',
+                'string',
+                'max:4000',
+                'min:1', // Message minimum de 2 caractères
+                function ($attribute, $value, $fail) {
+                    if (trim($value) === '') {
+                        $fail('Le message ne peut pas être vide.');
+                    }
+                },
+            ],
+            'model' => 'nullable|string',
         ]);
 
         try {
@@ -81,9 +92,9 @@ class MessageController extends Controller
             $fullResponse = '';
             $tokenBuffer = '';
             $tokenCount = 0;
-            $maxTokensPerBatch = 5;  // Réduit de 15 à 5 tokens par batch
+            $maxTokensPerBatch = 3;  // Réduit pour correspondre au style ChatGPT
             $lastBroadcastTime = microtime(true) * 1000;
-            $minBroadcastInterval = 25; // Réduit de 75ms à 25ms pour plus de fluidité
+            $minBroadcastInterval = 20; // Plus rapide comme ChatGPT
 
             // Nettoyer tous les buffers existants et désactiver le buffering
             while (ob_get_level() > 0) {
@@ -103,40 +114,72 @@ class MessageController extends Controller
             $lastPingTime = time();
 
             // 7. Itérer sur le flux et diffuser les chunks progressivement
-            foreach ($stream as $response) {
-                // Envoyer un ping si nécessaire
-                if (time() - $lastPingTime >= 5) {
-                    echo ":\n\n"; // Commentaire SSE pour maintenir la connexion
-                    // On vérifie et on ignore l'erreur si aucun buffer n'est actif
-                    if (ob_get_level() > 0) { @ob_flush(); }
-                    flush();
-                    $lastPingTime = time();
-                }
+            try {
+                foreach ($stream as $response) {
+                    // Vérifier si la réponse est valide
+                    if (!$response || !isset($response->choices[0]->delta)) {
+                        logger()->warning('Réponse invalide du provider:', ['response' => $response]);
+                        continue;
+                    }
 
-                $chunk = $response->choices[0]->delta->content ?? '';
-                if ($chunk) {
-                    $fullResponse .= $chunk;
-                    $tokenBuffer .= $chunk;
-                    $tokenCount++;
-                    $currentTime = microtime(true) * 1000;
-
-                    // Broadcast si on atteint le max de tokens OU si assez de temps s'est écoulé
-                    if ($tokenCount >= $maxTokensPerBatch || ($currentTime - $lastBroadcastTime >= $minBroadcastInterval)) {
-                        broadcast(new ChatMessageStreamed(
-                            channel: $channelName,
-                            content: $tokenBuffer,
-                            isComplete: false
-                        ));
-
-                        $tokenBuffer = '';
-                        $tokenCount = 0;
-                        $lastBroadcastTime = $currentTime;
-
-                        echo "data: " . json_encode(['status' => 'streaming']) . "\n\n";
+                    // Envoyer un ping si nécessaire
+                    if (time() - $lastPingTime >= 5) {
+                        echo ":\n\n"; // Commentaire SSE pour maintenir la connexion
+                        // On vérifie et on ignore l'erreur si aucun buffer n'est actif
                         if (ob_get_level() > 0) { @ob_flush(); }
                         flush();
+                        $lastPingTime = time();
+                    }
+
+                    $chunk = $response->choices[0]->delta->content ?? '';
+                    if ($chunk) {
+                        $fullResponse .= $chunk;
+                        $tokenBuffer .= $chunk;
+                        $tokenCount++;
+                        $currentTime = microtime(true) * 1000;
+
+                        // Broadcast si on atteint le max de tokens OU si assez de temps s'est écoulé
+                        if ($tokenCount >= $maxTokensPerBatch || ($currentTime - $lastBroadcastTime >= $minBroadcastInterval)) {
+                            broadcast(new ChatMessageStreamed(
+                                channel: $channelName,
+                                content: $tokenBuffer,
+                                isComplete: false
+                            ));
+
+                            $tokenBuffer = '';
+                            $tokenCount = 0;
+                            $lastBroadcastTime = $currentTime;
+
+                            echo "data: " . json_encode(['status' => 'streaming']) . "\n\n";
+                            if (ob_get_level() > 0) { @ob_flush(); }
+                            flush();
+                        }
                     }
                 }
+            } catch (\Exception $streamError) {
+                logger()->error('Erreur pendant le streaming:', [
+                    'error' => $streamError->getMessage(),
+                    'conversation_id' => $conversation->id
+                ]);
+
+                // Sauvegarder la réponse partielle si elle existe
+                if (!empty($fullResponse)) {
+                    $assistantMessage->update([
+                        'content' => $fullResponse . "\n\n[La réponse a été interrompue en raison d'une erreur]"
+                    ]);
+                }
+
+                broadcast(new ChatMessageStreamed(
+                    channel: "chat.{$conversation->id}",
+                    content: "Désolé, une erreur est survenue pendant la génération de la réponse. Veuillez réessayer.",
+                    isComplete: true,
+                    error: true
+                ));
+
+                return response()->json([
+                    'error' => 'Erreur de streaming',
+                    'code' => 'STREAM_ERROR'
+                ], 500);
             }
 
             // 8. Diffuser le buffer restant
@@ -162,10 +205,15 @@ class MessageController extends Controller
 
             // 11. Gestion intelligente du titre
             $shouldGenerateTitle = $conversation->title === 'Nouvelle conversation' ||
-                ($conversation->messages()->count() % 7 === 0); // Régénérer tous les 7 messages
+                $conversation->messages()->count() <= 2 || // Forcer la génération pour les premiers messages
+                ($conversation->messages()->count() % 7 === 0);
 
             if ($shouldGenerateTitle) {
                 try {
+                    // Délai réduit pour le premier message
+                    $delay = $conversation->messages()->count() <= 2 ? 0 : 1;
+                    sleep($delay);
+
                     // Utiliser les derniers messages comme contexte pour un titre plus pertinent
                     $contextMessages = $conversation->messages()
                         ->orderBy('created_at', 'desc')
@@ -177,21 +225,44 @@ class MessageController extends Controller
 
                     $titleStream = $this->chatService->generateTitle($contextMessages);
                     $titleContent = '';
+                    $titleBuffer = '';
+                    $lastTitleBroadcastTime = microtime(true) * 1000;
+                    $minTitleInterval = 50; // Plus rapide pour le titre
 
-                    // Stream le titre en temps réel
                     foreach ($titleStream as $response) {
                         $chunk = $response->choices[0]->delta->content ?? '';
                         if ($chunk) {
                             $titleContent .= $chunk;
-                            // Diffuser chaque morceau du titre en temps réel
-                            broadcast(new ChatMessageStreamed(
-                                channel: $channelName,
-                                content: $titleContent,
-                                isComplete: false,
-                                error: false,
-                                isTitle: true
-                            ));
+                            $titleBuffer .= $chunk;
+
+                            $currentTime = microtime(true) * 1000;
+                            if ($currentTime - $lastTitleBroadcastTime >= $minTitleInterval) {
+                                broadcast(new ChatMessageStreamed(
+                                    channel: $channelName,
+                                    content: $titleBuffer,
+                                    isComplete: false,
+                                    error: false,
+                                    isTitle: true
+                                ));
+
+                                $titleBuffer = '';
+                                $lastTitleBroadcastTime = $currentTime;
+
+                                // Forcer un petit délai
+                                usleep(25000); // 25ms de pause comme ChatGPT
+                            }
                         }
+                    }
+
+                    // S'assurer d'envoyer le buffer final
+                    if (!empty($titleBuffer)) {
+                        broadcast(new ChatMessageStreamed(
+                            channel: $channelName,
+                            content: $titleBuffer,
+                            isComplete: false,
+                            error: false,
+                            isTitle: true
+                        ));
                     }
 
                     // Nettoyer et sauvegarder le titre final
@@ -233,25 +304,32 @@ class MessageController extends Controller
         } catch (\Exception $e) {
             logger()->error('Erreur streamMessage:', [
                 'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString()
+                'trace' => $e->getTraceAsString(),
+                'conversation_id' => $conversation->id
             ]);
 
-            // Envoyer une réponse d'erreur avec un code 504 pour le timeout
+            $errorMessage = 'Une erreur est survenue';
+            $statusCode = 500;
+
             if (str_contains($e->getMessage(), 'timeout')) {
-                return response()->json([
-                    'error' => 'Le délai de réponse a été dépassé',
-                    'code' => 'TIMEOUT'
-                ], 504);
+                $errorMessage = 'Le délai de réponse a été dépassé';
+                $statusCode = 504;
+            } elseif (str_contains($e->getMessage(), 'Provider')) {
+                $errorMessage = 'Le service de chat est temporairement indisponible';
+                $statusCode = 503;
             }
 
             broadcast(new ChatMessageStreamed(
                 channel: "chat.{$conversation->id}",
-                content: "Erreur: " . $e->getMessage(),
+                content: "Erreur: " . $errorMessage,
                 isComplete: true,
                 error: true
             ));
 
-            return response()->json(['error' => $e->getMessage()], 500);
+            return response()->json([
+                'error' => $errorMessage,
+                'code' => 'ERROR'
+            ], $statusCode);
         }
     }
 

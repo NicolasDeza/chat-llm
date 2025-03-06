@@ -5,6 +5,8 @@ namespace App\Services;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use App\Models\CustomInstruction;
+use OpenAI\Client;
+use Illuminate\Support\Facades\Auth;
 
 class ChatService
 {
@@ -126,6 +128,69 @@ class ChatService
         ];
     }
 
+    protected function getSystemMessage(): array
+    {
+        return [
+            'role' => 'system',
+            'content' => <<<EOT
+Tu es un assistant IA expert et professionnel. Voici tes instructions principales :
+
+RÈGLES DE FORMATAGE :
+- Utilise le Markdown pour formater tes réponses
+- Utilise des blocs de code avec highlighting pour le code (`\`\`\`language`)
+- Mets en gras les points importants
+- Utilise des listes numérotées pour les étapes
+- Utilise des tableaux Markdown quand c'est pertinent
+
+STYLE DE RÉPONSE :
+- Sois direct et concis tout en restant professionnel
+- Structure tes réponses de manière claire
+- Pour du code, ajoute toujours des commentaires explicatifs
+- Fournis des exemples concrets quand c'est pertinent
+- Si pertinent, termine par une courte conclusion ou des bonnes pratiques
+
+CONTRAINTES :
+- Ne fournis jamais de code malveillant
+- Vérifie toujours les implications de sécurité
+- En cas de doute, demande des précisions
+- Reste factuel et précis
+
+Adapte ton niveau de détail selon la complexité de la question.
+EOT
+        ];
+    }
+
+    protected function getSystemMessageForTitle(): array
+    {
+        return [
+            'role' => 'system',
+            'content' => <<<EOT
+Tu es un expert en création de titres courts et précis.
+Ta tâche est de générer un titre qui capture l'essence de la conversation.
+
+RÈGLES STRICTES:
+- Le titre DOIT contenir entre 4 et 8 mots exactement
+- Maximum 60 caractères au total
+- Pas de caractères spéciaux ni de ponctuation
+- Pas de guillemets
+- Commence par une majuscule
+- Ne termine pas par un point
+- Évite les articles (le, la, les, un, une) sauf si nécessaire
+- Évite les mots génériques (discussion, conversation, échange)
+
+EXEMPLES DE BONS TITRES:
+- Développement Application Laravel avec VueJS
+- Optimisation Performance Base de Données
+- Integration Système Paiement Stripe API
+
+EXEMPLES À ÉVITER:
+- Nouveau défi (trop court)
+- Discussion développement (trop générique)
+- La conversation à propos du développement Laravel (trop long)
+EOT
+        ];
+    }
+
     /**
      * Diffuse un flux de réponse en streaming depuis l'API.
      *
@@ -140,7 +205,20 @@ class ChatService
             logger()->info('Début streamConversation', [
                 'model' => $model,
                 'temperature' => $temperature,
+                'messages_count' => count($messages)
             ]);
+
+            // Vérifier le dernier message utilisateur
+            $lastUserMessage = collect($messages)->last();
+            if ($lastUserMessage && $lastUserMessage['role'] === 'user') {
+                $content = trim($lastUserMessage['content']);
+
+                // Si le message est trop court, on l'enrichit
+                if (strlen($content) < 10) {
+                    $lastUserMessage['content'] = "Pourrais-tu répondre de manière détaillée à ceci: $content";
+                    $messages[array_key_last($messages)] = $lastUserMessage;
+                }
+            }
 
             $models = collect($this->getModels());
             if (!$model || !$models->contains('id', $model)) {
@@ -150,17 +228,27 @@ class ChatService
             // Ajout du prompt système au début des messages
             $messages = [$this->getChatSystemPrompt(), ...$messages];
 
-            // Ajout de try/catch spécifique pour les erreurs OpenRouter
             try {
                 $stream = $this->client->chat()->createStreamed([
                     'model' => $model,
                     'messages' => $messages,
-                    'temperature' => $temperature,
+                    'temperature' => 0.7, // Valeur ChatGPT par défaut
+                    'max_tokens' => 2048, // Similaire à ChatGPT
+                    'presence_penalty' => 0.5, // Valeur ChatGPT
+                    'frequency_penalty' => 0.5, // Valeur ChatGPT
+                    'stream' => true,
+                    'top_p' => 1, // Valeur ChatGPT
                 ]);
 
-                // Vérifier si le stream est valide
                 if (!$stream) {
-                    throw new \Exception("Erreur: Le service n'a pas retourné de réponse valide");
+                    throw new \Exception("Le provider n'a pas retourné de réponse valide");
+                }
+
+                // Test du premier chunk pour valider la réponse
+                $iterator = $stream->getIterator();
+                $iterator->rewind();
+                if (!$iterator->valid()) {
+                    throw new \Exception("Le stream initial est invalide");
                 }
 
                 return $stream;
@@ -169,22 +257,19 @@ class ChatService
                 logger()->error('Erreur OpenRouter:', [
                     'message' => $e->getMessage(),
                     'code' => $e->getCode(),
-                    'model' => $model
+                    'model' => $model,
+                    'last_message' => $lastUserMessage['content'] ?? null
                 ]);
 
-                // Messages d'erreur plus précis
-                if (str_contains(strtolower($e->getMessage()), 'rate limit')) {
-                    throw new \Exception("Quota d'appels API dépassé. Veuillez réessayer dans quelques minutes.");
-                }
-                if (str_contains(strtolower($e->getMessage()), 'invalid')) {
-                    throw new \Exception("Configuration API invalide. Contactez l'administrateur.");
+                if (str_contains(strtolower($e->getMessage()), 'provider')) {
+                    throw new \Exception("Le modèle est temporairement indisponible, essayez un autre modèle.");
                 }
 
-                throw new \Exception("Le service OpenRouter est temporairement indisponible. Veuillez réessayer.");
+                throw $e;
             }
 
         } catch (\Exception $e) {
-            logger()->error('Erreur dans streamConversation:', [
+            logger()->error('Erreur critique dans streamConversation:', [
                 'message' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
             ]);
@@ -192,14 +277,53 @@ class ChatService
         }
     }
 
+    private function enrichShortMessage(string $message): string
+    {
+        $message = trim($message);
+        $commonGreetings = ['bonjour', 'salut', 'hey', 'hello', 'hi', 'coucou'];
+
+        if (strlen($message) < 10) {
+            foreach ($commonGreetings as $greeting) {
+                if (stripos($message, $greeting) !== false) {
+                    return "Le message initial est une salutation: '$message'. En tant qu'assistant, je vais vous aider tout au long de nos échanges. Je suis là pour répondre à vos questions et vous assister dans vos tâches.";
+                }
+            }
+            return "Le message initial est court: '$message'. En tant qu'assistant, je vais analyser votre demande et vous fournir une réponse appropriée.";
+        }
+        return $message;
+    }
+
     public function generateTitle(string $messages): mixed
     {
+        // Enrichir le contexte pour les premiers messages courts
+        $messagesArray = explode("\n", $messages);
+        if (count($messagesArray) <= 2) {
+            $messages = $this->enrichShortMessage($messages);
+        }
+
+        $prompt = <<<EOT
+Analyse cette conversation et génère un titre professionnel qui respecte ces règles:
+
+RÈGLES OBLIGATOIRES:
+- Entre 4 et 6 mots exactement
+- Pas d'articles inutiles
+- Pas de ponctuation
+- Style professionnel et technique
+- Capture le sujet principal
+
+Conversation:
+$messages
+
+Génère uniquement le titre, sans autre texte ni explications.
+EOT;
+
         return $this->streamConversation(
             messages: [[
                 'role' => 'user',
-                'content' => "Je souhaite que tu génères un titre court et percutant, contenant au maximum 4 mots, qui résume avec précision l’échange suivant :\n\n$messages\n\nLe titre doit être concis et direct, sans phrase complète ni texte additionnel. Si l’échange est incohérent, illisible ou trop bref pour être résumé, ta seule réponse doit être : 'Demande de clarification'. Aucune autre information ne doit être ajoutée, même si cela semble pertinent. Si la conversation est trop complexe ou trop longue, réponds simplement 'Résumé de la discussion'."
+                'content' => $prompt
             ]],
-            model: self::DEFAULT_MODEL
+            model: self::DEFAULT_MODEL,
+            temperature: 0.5 // Réduit pour des titres plus consistants comme ChatGPT
         );
     }
 
